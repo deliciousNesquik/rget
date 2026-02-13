@@ -1,0 +1,13 @@
+[project]
+name = "rget"
+version = "1.0.0"
+description = "High-performance remote file transfer tool with parallel downloads via SSH/SFTP"
+requires-python = ">=3.7"
+
+dependencies = [
+    "asyncssh>=2.13.0",
+    "tqdm>=4.65.0",
+]
+
+[project.scripts]
+rget = "rget:main"

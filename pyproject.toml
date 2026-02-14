@@ -2,6 +2,12 @@
 name = "rget"
 version = "1.0.0"
 description = "High-performance remote file transfer tool with parallel downloads via SSH/SFTP"
+license = "MIT"
+readme = "README.md"
+authors = [
+    { name = "deliciousNesquik", email = "byte.in4matic@gmail.com" },
+]
+
 requires-python = ">=3.7"
 
 dependencies = [

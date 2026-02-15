@@ -40,10 +40,10 @@ class Config:
     DEFAULT_MAX_DEPTH = 1
 
     # Default remote settings (can be overridden)
-    DEFAULT_REMOTE_USER = ""
-    DEFAULT_REMOTE_HOST = ""
-    DEFAULT_REMOTE_DIR = ""
-    DEFAULT_LOCAL_DIR = ""
+    DEFAULT_REMOTE_USER = "root"
+    DEFAULT_REMOTE_HOST = "185.178.46.178"
+    DEFAULT_REMOTE_DIR = "/home/node/Web-App-Komtransservice/backend/logs"
+    DEFAULT_LOCAL_DIR = "~/Downloads/test"  # Default local directory for downloads
 
 
 class RemoteFileSyncClient:
@@ -60,6 +60,7 @@ class RemoteFileSyncClient:
             max_concurrent: int = 5,
             timeout: int = 30,
             max_depth: int = 1,
+            accept_new: bool = False,
     ):
         self.host = host
         self.username = username
@@ -71,39 +72,130 @@ class RemoteFileSyncClient:
         self.timeout = timeout
         self.logger = logging.getLogger(__name__)
         self.max_depth = max_depth
+        self.accept_new = accept_new
+
 
     async def connect(self) -> asyncssh.SSHClientConnection:
-        """Establish SSH connection with flexible authentication."""
-
+        """Establish SSH connection with host key verification (accept-new support)."""
+        
+        ssh_dir = Path.home() / '.ssh'
+        known_hosts_path = ssh_dir / 'known_hosts'
+        
+        # Создаём ~/.ssh если не существует
+        ssh_dir.mkdir(mode=0o700, exist_ok=True)
+        
         connection_kwargs = {
             'host': self.host,
             'port': self.port,
             'username': self.username,
-            #'known_hosts': asyncssh.SSHKnownHosts.from_file('~/.ssh/known_hosts'),
-            'connect_timeout': self.timeout
+            'connect_timeout': self.timeout,
         }
-
-        # Priority: SSH key -> Password
+        
+        # === АУТЕНТИФИКАЦИЯ ===
         if self.ssh_key_path:
-            self.logger.debug(f"Connecting with an SSH key: {self.ssh_key_path}")
+            self.logger.debug(f"Connecting with SSH key: {self.ssh_key_path}")
             connection_kwargs['client_keys'] = [self.ssh_key_path]
             if self.passphrase:
                 connection_kwargs['passphrase'] = self.passphrase
         elif self.password:
-            self.logger.debug("Connection with a password")
+            self.logger.debug("Connecting with password")
             connection_kwargs['password'] = self.password
         else:
-            # Try to use SSH agent
             self.logger.debug("Attempting to use SSH agent")
-
+        
+        # === УПРАВЛЕНИЕ КЛЮЧАМИ ХОСТА ===
+        if self.accept_new:
+            self.logger.warning(
+                "accept-new mode active: New host keys will be accepted and saved to ~/.ssh/known_hosts. "
+                "CHANGED keys will be REJECTED (MITM protection)."
+            )
+            
+            # Шаг 1: Попробуем подключиться со строгой проверкой (если known_hosts существует)
+            if known_hosts_path.exists():
+                connection_kwargs['known_hosts'] = str(known_hosts_path)
+                try:
+                    conn = await asyncssh.connect(**connection_kwargs)
+                    self.logger.debug(f"Connected with verified host key from {known_hosts_path}")
+                    return conn
+                except asyncssh.HostKeyNotVerifiable as e:
+                    error_msg = str(e).lower()
+                    # Если ключ не найден — продолжаем к шагу 2
+                    if 'is not in the known_hosts file' not in error_msg and \
+                    'host key is not trusted' not in error_msg:
+                        # Ключ изменился — это MITM!
+                        if 'does not match' in error_msg or 'host key has changed' in error_msg:
+                            self.logger.critical(
+                                "SECURITY ALERT: Server host key CHANGED!\n"
+                                "Possible MITM attack or server rekey. Connection ABORTED.\n"
+                                f"To reset: ssh-keygen -R [{self.host}]:{self.port}"
+                            )
+                            raise RuntimeError("Host key changed — possible MITM attack") from e
+                        raise
+            
+            # Шаг 2: Первое подключение — отключаем проверку для получения ключа
+            self.logger.warning(f"New host detected: {self.host}:{self.port}. Accepting key...")
+            connection_kwargs['known_hosts'] = None
+            conn = await asyncssh.connect(**connection_kwargs)
+            
+            # Шаг 3: Получаем ключ сервера и сохраняем в known_hosts
+            server_key = conn.get_server_host_key()
+            key_data = server_key.export_public_key().decode('ascii').strip()
+            
+            # Формат OpenSSH known_hosts:
+            #   hostname ssh-rsa AAAAB3NzaC1yc2EAAA...
+            #   [hostname]:port ssh-rsa AAAAB3NzaC1yc2EAAA... (для нестандартных портов)
+            if self.port == 22:
+                host_spec = self.host
+            else:
+                host_spec = f"[{self.host}]:{self.port}"
+            
+            # Ключ уже содержит тип + данные: "ssh-rsa AAAAB3NzaC1yc2EAAA..."
+            entry = f"{host_spec} {key_data}\n"
+            
+            # Добавляем запись в known_hosts
+            with open(known_hosts_path, 'a', encoding='utf-8') as f:
+                f.write(entry)
+            known_hosts_path.chmod(0o600)  # Обязательно 600!
+            
+            self.logger.warning(
+                f"New host key accepted and saved to {known_hosts_path}\n"
+                f"Host: {host_spec} | Key type: {server_key.get_algorithm()}"
+            )
+            
+            return conn
+        
+        else:
+            # Строгая проверка (поведение по умолчанию)
+            if known_hosts_path.exists():
+                connection_kwargs['known_hosts'] = str(known_hosts_path)
+                self.logger.debug(f"Using strict host key verification with {known_hosts_path}")
+            else:
+                self.logger.error(
+                    "~/.ssh/known_hosts not found. Cannot verify server identity.\n"
+                    "Options:\n"
+                    "1. Pre-populate: ssh-keyscan -p {port} {host} >> ~/.ssh/known_hosts\n"
+                    "2. Use --accept-new for FIRST connection in trusted environments ONLY"
+                )
+                raise RuntimeError("Host key verification impossible: known_hosts missing")
+        
+        # Выполняем подключение
         try:
             conn = await asyncssh.connect(**connection_kwargs)
             self.logger.debug(f"Connected to {self.username}@{self.host}:{self.port}")
             return conn
-        except Exception as e:
-            self.logger.error(f"Connection error: {e}")
+        except asyncssh.HostKeyNotVerifiable as e:
+            self.logger.error(
+                f"Host key verification failed: {e}\n"
+                "Possible causes:\n"
+                "• First connection (use --accept-new ONLY in trusted environments)\n"
+                "• Server key changed (MITM risk!)\n"
+                "• ~/.ssh/known_hosts permissions too open (should be 600)"
+            )
             raise
-
+        except Exception as e:
+            self.logger.error(f"Connection error: {type(e).__name__}: {e}")
+            raise
+    
     async def find_files(
             self,
             conn: asyncssh.SSHClientConnection,
@@ -283,6 +375,13 @@ For quick setup, edit the Config class in the script.
     ssh_group = parser.add_argument_group('Connection parameters')
 
     ssh_group.add_argument(
+        '--accept-new',
+        action='store_true',
+        help='Automatically accept and save new host keys (like OpenSSH StrictHostKeyChecking=accept-new). '
+            'Keys are saved to ~/.ssh/known_hosts. Safer than disabling verification entirely.'
+    )
+
+    ssh_group.add_argument(
         '-H', '--host',
         default=(Config.DEFAULT_REMOTE_HOST if Config.DEFAULT_REMOTE_HOST else "None"),
         help=f'Remote server host (default: {Config.DEFAULT_REMOTE_HOST if Config.DEFAULT_REMOTE_HOST else "None"})'
@@ -402,6 +501,7 @@ async def async_main():
         max_concurrent=args.concurrent,
         timeout=args.timeout,
         max_depth=args.maxdepth,
+        accept_new=args.accept_new,
     )
 
     try:

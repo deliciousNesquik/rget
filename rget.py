@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Remote File Sync Utility
-A high-performance, cross-platform tool for downloading files from remote servers via SSH/SFTP
-with parallel transfers, progress tracking, and flexible authentication.
-"""
 
 import argparse
 import asyncio
@@ -14,7 +9,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
-import platform
+
+VERSION = "1.2.0"
 
 # Try to import tqdm for progress bars, fall back to simple logging if not available
 try:
@@ -25,8 +21,6 @@ try:
 except ImportError:
     TQDM_AVAILABLE = False
     print("Install 'tqdm' for progress bars: pip install tqdm")
-
-VERSION = "1.0.0"
 
 
 class Config:
@@ -40,10 +34,9 @@ class Config:
     DEFAULT_MAX_DEPTH = 1
 
     # Default remote settings (can be overridden)
-    DEFAULT_REMOTE_USER = "root"
-    DEFAULT_REMOTE_HOST = "185.178.46.178"
-    DEFAULT_REMOTE_DIR = "/home/node/Web-App-Komtransservice/backend/logs"
-    DEFAULT_LOCAL_DIR = "~/Downloads/test"  # Default local directory for downloads
+    DEFAULT_REMOTE_USER = ""
+    DEFAULT_REMOTE_HOST = ""
+    DEFAULT_REMOTE_DIR = ""
 
 
 class RemoteFileSyncClient:
@@ -61,6 +54,8 @@ class RemoteFileSyncClient:
             timeout: int = 30,
             max_depth: int = 1,
             accept_new: bool = False,
+            ignore_case: bool = False,
+            dry_run: bool = False,
     ):
         self.host = host
         self.username = username
@@ -73,6 +68,8 @@ class RemoteFileSyncClient:
         self.logger = logging.getLogger(__name__)
         self.max_depth = max_depth
         self.accept_new = accept_new
+        self.ignore_case = ignore_case
+        self.dry_run = dry_run
 
 
     async def connect(self) -> asyncssh.SSHClientConnection:
@@ -204,7 +201,8 @@ class RemoteFileSyncClient:
     ) -> List[str]:
         """Find files on remote server matching pattern."""
 
-        find_cmd = f"find {remote_dir} -maxdepth {self.max_depth} -name '{pattern}' -type f -size +0c"
+        find_cmd = f"find {remote_dir} -maxdepth {self.max_depth} " \
+                   f"{'-iname' if self.ignore_case else '-name'} '{pattern}' -type f -size +0c"
         self.logger.debug(f"Searching {find_cmd}")
 
         try:
@@ -222,8 +220,7 @@ class RemoteFileSyncClient:
             self,
             sftp: asyncssh.SFTPClient,
             remote_path: str,
-            local_path: Path,
-            pbar: Optional[tqdm] = None
+            local_path: Path
     ) -> tuple[str, bool]:
         """Download single file via SFTP."""
 
@@ -234,8 +231,6 @@ class RemoteFileSyncClient:
 
             # Verify file was downloaded and has size
             if local_path.exists() and local_path.stat().st_size > 0:
-                if pbar:
-                    pbar.update(1)
                 self.logger.debug(f"{filename}")
                 return filename, True
             else:
@@ -250,67 +245,34 @@ class RemoteFileSyncClient:
             self.logger.error(f"{filename} - {str(e)}")
             return filename, False
 
-    async def download_files_parallel(
+    async def download_files_sequential(
             self,
             remote_files: List[str],
-            local_dir: Path
+            local_dir: Path,
+            conn: asyncssh.SSHClientConnection,  # Соединение НЕ закрываем здесь
+            master_pbar: Optional[tqdm] = None,
     ) -> dict:
-        """Download multiple files in parallel with progress tracking."""
-
+        """Download files sequentially via SINGLE connection (no internal parallelism)."""
         if not remote_files:
-            self.logger.warning("There are no files to upload.")
             return {'success': [], 'failed': []}
 
-        # Ensure local directory exists
         local_dir.mkdir(parents=True, exist_ok=True)
+        success, failed = [], []
 
-        # Connect and start SFTP
-        conn = await self.connect()
-
-        try:
-            async with conn.start_sftp_client() as sftp:
-                # Create semaphore for concurrent downloads
-                semaphore = asyncio.Semaphore(self.max_concurrent)
-
-                async def download_with_semaphore(remote_path: str, pbar):
-                    async with semaphore:
-                        filename = os.path.basename(remote_path)
-                        local_path = local_dir / filename
-                        return await self.download_file(sftp, remote_path, local_path, pbar)
-
-                # Progress bar
-                if TQDM_AVAILABLE:
-                    pbar = tqdm(
-                        total=len(remote_files),
-                        desc="Loading",
-                        unit="file",
-                        ncols=80,
-                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
-                    )
+        async with conn.start_sftp_client() as sftp:
+            for remote_path in remote_files:
+                filename = os.path.basename(remote_path)
+                local_path = local_dir / filename
+                fname, ok = await self.download_file(sftp, remote_path, local_path)
+                if ok:
+                    success.append(fname)
                 else:
-                    pbar = None
-                    self.logger.debug(f"Start downloading {len(remote_files)} file(s)...")
+                    failed.append(fname)
 
-                # Download all files in parallel
-                tasks = [
-                    download_with_semaphore(remote_path, pbar)
-                    for remote_path in remote_files
-                ]
+                if master_pbar:
+                    master_pbar.update(1)
 
-                results = await asyncio.gather(*tasks)
-
-                if pbar:
-                    pbar.close()
-
-                # Separate successful and failed downloads
-                success = [f for f, status in results if status]
-                failed = [f for f, status in results if not status]
-
-                return {'success': success, 'failed': failed}
-
-        finally:
-            conn.close()
-            await conn.wait_closed()
+        return {'success': success, 'failed': failed}
 
 
 def setup_logging(verbose: bool = False):
@@ -367,12 +329,19 @@ For quick setup, edit the Config class in the script.
 
     parser.add_argument(
         'local_dir',
-        default=Config.DEFAULT_LOCAL_DIR,
         help='Local directory for saving files'
     )
 
+    other_group = parser.add_argument_group('other arguments')
+
+    other_group.add_argument(
+        '--dry-run',
+        action='store_true',
+        help="Shows which files will be downloaded without actual data transfer"
+    )
+
     # SSH Connection options
-    ssh_group = parser.add_argument_group('Connection parameters')
+    ssh_group = parser.add_argument_group('connection arguments')
 
     ssh_group.add_argument(
         '--accept-new',
@@ -393,7 +362,7 @@ For quick setup, edit the Config class in the script.
         help=f'Server username (default: {Config.DEFAULT_REMOTE_USER if Config.DEFAULT_REMOTE_USER else "None"})'
     )
 
-    parser.add_argument(
+    ssh_group.add_argument(
         '-P', '--port',
         type=int,
         default=Config.DEFAULT_SSH_PORT,
@@ -406,15 +375,23 @@ For quick setup, edit the Config class in the script.
         help=f'Directory on the server to search (default: {Config.DEFAULT_REMOTE_DIR if Config.DEFAULT_REMOTE_DIR else "None"})'
     )
 
-    ssh_group.add_argument(
+    find_group = parser.add_argument_group('find arguments')
+
+    find_group.add_argument(
         '-m', '--maxdepth',
         type=int,
         default=(Config.DEFAULT_MAX_DEPTH if Config.DEFAULT_MAX_DEPTH else "None"),
-        help='Maximum search depth (default: 1; use 0 for unlimited)'
+        help='Maximum search depth'
+    )
+
+    find_group.add_argument(
+        '-i', '--ignore-case',
+        action='store_true',
+        help='Perform case-insensitive file search (uses -iname in find)'
     )
 
     # Authentication options
-    auth_group = parser.add_argument_group('Authentication')
+    auth_group = parser.add_argument_group('Authentication arguments')
 
     auth_group.add_argument(
         '-k', '--ssh-key',
@@ -432,7 +409,7 @@ For quick setup, edit the Config class in the script.
     )
 
     # Performance options
-    perf_group = parser.add_argument_group('Performance parameters')
+    perf_group = parser.add_argument_group('performance arguments')
 
     perf_group.add_argument(
         '-c', '--concurrent',
@@ -451,7 +428,7 @@ For quick setup, edit the Config class in the script.
     # Other options
     parser.add_argument(
         '-v', '--verbose',
-        action='store_true',  # ← Правильный способ для флагов
+        action='store_true',
         help='Detailed output for debugging'
     )
 
@@ -502,19 +479,22 @@ async def async_main():
         timeout=args.timeout,
         max_depth=args.maxdepth,
         accept_new=args.accept_new,
+        ignore_case=args.ignore_case,
+        dry_run=args.dry_run,
     )
 
     try:
         # Connect and find files
-        conn = await client.connect()
+        conn_search = await client.connect()
+        #conn = await client.connect()
 
         try:
             # Find files
-            remote_files = await client.find_files(conn, args.remote_dir, args.pattern)
+            remote_files = await client.find_files(conn_search, args.remote_dir, args.pattern)
 
             if not remote_files:
                 logger.error(f"Files by pattern '{args.pattern}' not found in {args.remote_dir}")
-                return 0
+                return 1
 
             # Show file list if verbose
             if args.verbose:
@@ -523,42 +503,78 @@ async def async_main():
                     logger.debug(f"• {os.path.basename(f)}")
 
         finally:
-            conn.close()
-            await conn.wait_closed()
+            conn_search.close()
+            await conn_search.wait_closed()
+
+        if args.dry_run:
+            if not args.verbose:
+                logger.info("DRY RUN — files that would be downloaded:")
+                logger.info(f"Files matching pattern '{args.pattern}':")
+                for f in remote_files:
+                    logger.info(f"• {os.path.basename(f)}")
+                logger.info(f"Total: {len(remote_files)} file(s) | Use without --dry-run to download")
+
+            return 0
 
         # Download files in parallel
         if args.verbose:
             logger.debug(f"Parallel downloads: {args.concurrent}")
             logger.debug(f"Target directory: {local_dir.absolute()}\n")
 
+        if TQDM_AVAILABLE and not args.dry_run:
+            master_pbar = tqdm(
+                total=len(remote_files),
+                desc="Downloading",
+                unit="file",
+                ncols=80,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+            )
+        else:
+            master_pbar = None
+
+        num_conns = min(args.concurrent, len(remote_files))  # Не создаём лишних
+        download_conns = [await client.connect() for _ in range(num_conns)]
+
+        groups = [[] for _ in range(num_conns)]
+        for i, f in enumerate(remote_files):
+            groups[i % num_conns].append(f)
+
+        tasks = [
+            client.download_files_sequential(group, local_dir, download_conns[i], master_pbar)
+            for i, group in enumerate(groups) if group
+        ]
+
         start_time = datetime.now()
 
-        results = await client.download_files_parallel(remote_files, local_dir)
+        group_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
 
-        # Print results
-        print(f"Successfully uploaded: {len(results['success'])}/{len(remote_files)} file(s)")
+        all_success, all_failed = [], []
+        for res in group_results:
+            if isinstance(res, dict):
+                all_success.extend(res['success'])
+                all_failed.extend(res['failed'])
+            else:
+                logger.error(f"Group download failed: {res}")
 
-        if results['failed']:
-            print(f"Failed to load: {len(results['failed'])} file(s)")
+        # Print results
+        print(f"Successfully downloaded: {len(all_success)}/{len(remote_files)} file(s)")
+
+        if all_failed:
+            print(f"Failed: {len(all_failed)} file(s)")
             if args.verbose:
-                logger.warning("Download errors:")
-                for f in results['failed']:
+                for f in all_failed:
                     logger.debug(f"• {f}")
 
         if args.verbose:
-            logger.debug(f"Finish time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             logger.debug(f"Duration: {duration:.2f} seconds")
-
-        if args.verbose:
-            if len(results['success']) > 0:
-                avg_time = duration / len(results['success'])
-                logger.debug(f"Average time per file: {avg_time:.2f} seconds")
+            if all_success:
+                logger.debug(f"Average time per file: {duration / len(all_success):.2f} seconds")
 
         # Exit with appropriate code
-        return 0 if not results['failed'] else 1
+        return 0 if not all_failed else 1
 
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
@@ -569,6 +585,12 @@ async def async_main():
             import traceback
             traceback.print_exc()
         return 1
+
+    finally:
+        # Закрываем ВСЕ соединения скачивания
+        for c in download_conns:
+            c.close()
+            await c.wait_closed()
 
 
 def main():

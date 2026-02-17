@@ -4,6 +4,103 @@
 Формат основан на [Keepa Changelog](http://keepachangelog.com/)
 и этот проект придерживается [семантического версионирования](http://semver.org/).
 
+## 1.3.0 - 2026-02-17
+
+### Исправлено
+Метод ```connect()``` наконец-то занимается практически только соединением, а не настройкой путей и файла known_hosts.
+
+### Добавлено
+
+Новые флаги для поска файлов удовлетворяющих размеры. 
+```--size-gt``` флаг отвечает за размер файла который будет выше чем указано
+```--size-lt``` флаг отвечает за размер файла который будет не выше чем указано.
+
+Ниже предствлен пример использования двух флагов сразу (**можно использовать по раздельности каждый**), для примеров взяли файлы
+размером больше 0 байт и меньше 10 мегабайт в первом примере и меньше 15 мегабайт во втором примере.
+
+1) Используем флаг ```--dry-run``` чтобы только просмотреть результат без скачивания и также ```-v``` для детального вывода информации, это нам нужно чтобы видеть строчки 
+```Searching find...```
+. <br> **Теперь самое главное** флаги ```--size-gt 0c``` ```--size-lt 10M```. Результат видем в виде 3 файлов.
+```shell
+C:\Users\BERDIN.A\PycharmProjects\rget>uv run rget.py --dry-run --size-gt 0c --size-lt 10M -v -c 5 2026_02_16__* C:\Users\BERDIN.A\Downloads\test
+SSH agent is used for authentication
+Make sure the key is added: ssh-add
+
+Attempting to use SSH agent
+Using strict host key verification with C:\Users\BERDIN.A\.ssh\known_hosts
+Connected to berdin.a@pdc-vm.tn.reid.local:22
+Searching find /var/ibshadow -maxdepth 1 -name '2026_02_16__*' -type f -size +0c -size -10M
+Files found: 3
+
+List of files to download:
+• 2026_02_16__00_40_01.log
+• 2026_02_16__02_40_01.log
+• 2026_02_16__01_40_01.log
+```
+2) Теперь просмотрим вывод если поменять флаг ```--size-lt 10M``` на значение **15** получатся следующие флаги: ```--size-gt 0c``` ```--size-lt 15M```.
+<br>Результат видем в виде 11 файлов.
+```shell
+C:\Users\BERDIN.A\PycharmProjects\rget>uv run rget.py --dry-run --size-gt 0c --size-lt 15M -v -c 5 2026_02_16__* C:\Users\BERDIN.A\Downloads\test
+SSH agent is used for authentication
+Make sure the key is added: ssh-add
+
+Attempting to use SSH agent
+Using strict host key verification with C:\Users\BERDIN.A\.ssh\known_hosts
+Connected to berdin.a@pdc-vm.tn.reid.local:22
+Searching find /var/ibshadow -maxdepth 1 -name '2026_02_16__*' -type f -size +0c -size -15M
+Files found: 11
+
+List of files to download:
+• 2026_02_16__00_00_01.log
+• 2026_02_16__03_40_01.log
+• 2026_02_16__00_40_01.log
+• 2026_02_16__01_20_01.log
+• 2026_02_16__02_00_01.log
+• 2026_02_16__02_20_01.log
+• 2026_02_16__02_40_01.log
+• 2026_02_16__03_20_01.log
+• 2026_02_16__01_00_01.log
+• 2026_02_16__01_40_01.log
+• 2026_02_16__00_20_01.log
+```
+3) Если вдруг использовать неверные значения для размеров файлов тогда произойдет следующее, я предоставил два варианта вывода информации
+
+Если использовать флаг ```-v``` или ```--verbose```
+```shell
+C:\Users\BERDIN.A\PycharmProjects\rget>uv run rget.py --dry-run --size-gt 0c --size-lt 15P -v -c 5 2026_02_16__* C:\Users\BERDIN.A\Downloads\test
+SSH agent is used for authentication
+Make sure the key is added: ssh-add
+
+Attempting to use SSH agent
+Using strict host key verification with C:\Users\BERDIN.A\.ssh\known_hosts
+Connected to berdin.a@pdc-vm.tn.reid.local:22
+Searching find /var/ibshadow -maxdepth 1 -name '2026_02_16__*' -type f -size +0c -size -15P
+File search error: Process exited with non-zero exit status 1
+Files by pattern '2026_02_16__*' not found in /var/ibshadow
+```
+Или если не использовать флаг ```-v``` или ```--verbose```
+```shell
+C:\Users\BERDIN.A\PycharmProjects\rget>uv run rget.py --dry-run --size-gt 0c --size-lt 15P -c 5 2026_02_16__* C:\Users\BERDIN.A\Downloads\test
+File search error: Process exited with non-zero exit status 1
+Files by pattern '2026_02_16__*' not found in /var/ibshadow
+```
+
+Если вы вдруг не увидели, где ошибка вот отдельной строчкой
+<br>
+```shell
+File search error: Process exited with non-zero exit status 1
+```
+
+Разберем символы которые можно использовать для размеров файлов
+
+| Символ | Обозначение | Пример    |
+|--------|-------------|-----------|
+| `c`    | байт        | ```0c```  |
+| `k`    | килобайт    | ```50k``` |
+| `M`    | мегабайт    | ```10M``` |
+| `G`    | гигабайт    | ```1G```  |
+
+
 ## 1.2.1 - 2026-02-16
 ## Исправлено
 - Код был оптимизирован и отформатирован через утилиту ruff ```uvx ruff check``` ```uvx ruff format```

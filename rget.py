@@ -8,9 +8,9 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Try to import tqdm for progress bars, fall back to simple logging if not available
 try:
@@ -33,9 +33,46 @@ class Config:
     DEFAULT_MAX_DEPTH = 1
 
     # Default remote settings (can be overridden)
-    DEFAULT_REMOTE_USER = ""
-    DEFAULT_REMOTE_HOST = ""
-    DEFAULT_REMOTE_DIR = ""
+    DEFAULT_REMOTE_USER = "berdin.a"
+    DEFAULT_REMOTE_HOST = "pdc-vm.tn.reid.local"
+    DEFAULT_REMOTE_DIR = "/var/ibshadow"
+
+
+async def _get_kh_path() -> Path:
+    """ Возвращает путь до файла known_hosts, предварительно
+    проверив существование пути, если отсутствует создает папку .ssh """
+
+    ssh_dir = Path.home() / ".ssh"
+    known_hosts_path = ssh_dir / "known_hosts"
+
+    # Создаём директорию ~/.ssh если не существует
+    # Для ОС Linux ~/.ssh
+    # Для ОС Windows C:\Users\(CurrentUser)\.ssh
+    ssh_dir.mkdir(mode=0o700, exist_ok=True)
+    return known_hosts_path
+
+
+async def _create_kh_file(host: str, port: int, key_data: str, known_hosts_path: Path) -> dict[str, str | None]:
+    # Формат OpenSSH known_hosts:
+    #   hostname ssh-rsa AAAAB3NzaC1yc2EAAA...
+    #   [hostname]:port ssh-rsa AAAAB3NzaC1yc2EAAA... (для нестандартных портов)
+    if port == 22:
+        host_spec = host
+    else:
+        host_spec = f"[{host}]:{port}"
+
+    # Ключ уже содержит тип + данные: "ssh-rsa AAAAB3NzaC1yc2EAAA..."
+    entry = f"{host_spec} {key_data}\n"
+
+    # Добавляем запись в known_hosts
+    try:
+        with open(known_hosts_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except FileNotFoundError:
+        return {'host_spec': None, 'key_data': None}
+    known_hosts_path.chmod(0o600)  # Обязательно 600!
+
+    return {'host_spec': host_spec, 'key_data': key_data}
 
 
 class RemoteFileSyncClient:
@@ -55,6 +92,8 @@ class RemoteFileSyncClient:
         accept_new: bool = False,
         ignore_case: bool = False,
         dry_run: bool = False,
+        size_gt: Optional[str] = None,
+        size_lt: Optional[str] = None,
     ):
         self.host = host
         self.username = username
@@ -69,15 +108,14 @@ class RemoteFileSyncClient:
         self.accept_new = accept_new
         self.ignore_case = ignore_case
         self.dry_run = dry_run
+        self.size_gt = size_gt
+        self.size_lt = size_lt
+
 
     async def connect(self) -> asyncssh.SSHClientConnection:
         """Establish SSH connection with host key verification (accept-new support)."""
 
-        ssh_dir = Path.home() / ".ssh"
-        known_hosts_path = ssh_dir / "known_hosts"
-
-        # Создаём ~/.ssh если не существует
-        ssh_dir.mkdir(mode=0o700, exist_ok=True)
+        known_hosts_path = await _get_kh_path()
 
         connection_kwargs = {
             "host": self.host,
@@ -86,7 +124,7 @@ class RemoteFileSyncClient:
             "connect_timeout": self.timeout,
         }
 
-        # === АУТЕНТИФИКАЦИЯ ===
+        # Блок аутентификации соединения
         if self.ssh_key_path:
             self.logger.debug(f"Connecting with SSH key: {self.ssh_key_path}")
             connection_kwargs["client_keys"] = [self.ssh_key_path]
@@ -98,7 +136,7 @@ class RemoteFileSyncClient:
         else:
             self.logger.debug("Attempting to use SSH agent")
 
-        # === УПРАВЛЕНИЕ КЛЮЧАМИ ХОСТА ===
+        # Блок управления ключами хоста соединения
         if self.accept_new:
             self.logger.warning(
                 "accept-new mode active: New host keys will be accepted and saved to ~/.ssh/known_hosts. "
@@ -147,25 +185,11 @@ class RemoteFileSyncClient:
             server_key = conn.get_server_host_key()
             key_data = server_key.export_public_key().decode("ascii").strip()
 
-            # Формат OpenSSH known_hosts:
-            #   hostname ssh-rsa AAAAB3NzaC1yc2EAAA...
-            #   [hostname]:port ssh-rsa AAAAB3NzaC1yc2EAAA... (для нестандартных портов)
-            if self.port == 22:
-                host_spec = self.host
-            else:
-                host_spec = f"[{self.host}]:{self.port}"
-
-            # Ключ уже содержит тип + данные: "ssh-rsa AAAAB3NzaC1yc2EAAA..."
-            entry = f"{host_spec} {key_data}\n"
-
-            # Добавляем запись в known_hosts
-            with open(known_hosts_path, "a", encoding="utf-8") as f:
-                f.write(entry)
-            known_hosts_path.chmod(0o600)  # Обязательно 600!
+            result_create_kh_file = await _create_kh_file(self.host, self.port, key_data, known_hosts_path)
 
             self.logger.warning(
                 f"New host key accepted and saved to {known_hosts_path}\n"
-                f"Host: {host_spec} | Key type: {server_key.get_algorithm()}"
+                f"Host: {result_create_kh_file['host_spec']} | Key type: {server_key.get_algorithm()}"
             )
 
             return conn
@@ -208,12 +232,14 @@ class RemoteFileSyncClient:
 
     async def find_files(
         self, conn: asyncssh.SSHClientConnection, remote_dir: str, pattern: str
-    ) -> List[str]:
+    ) -> list[bytes] | list[Any]:
         """Find files on remote server matching pattern."""
 
         find_cmd = (
             f"find {remote_dir} -maxdepth {self.max_depth} "
-            f"{'-iname' if self.ignore_case else '-name'} '{pattern}' -type f -size +0c"
+            f"{'-iname' if self.ignore_case else '-name'} '{pattern}' -type f "
+            f"{'-size +' + self.size_gt if self.size_gt else ''} "
+            f"{'-size -' + self.size_lt if self.size_lt else ''} "
         )
         self.logger.debug(f"Searching {find_cmd}")
 
@@ -239,7 +265,7 @@ class RemoteFileSyncClient:
             await sftp.get(remote_path, str(local_path))
 
             # Verify file was downloaded and has size
-            if local_path.exists() and local_path.stat().st_size > 0:
+            if local_path.exists(): # and local_path.stat().st_size > 0:
                 self.logger.debug(f"{filename}")
                 return filename, True
             else:
@@ -399,6 +425,16 @@ For quick setup, edit the Config class in the script.
         help="Perform case-insensitive file search (uses -iname in find)",
     )
 
+    find_group.add_argument(
+        "--size-gt",
+        help="",
+    )
+
+    find_group.add_argument(
+        "--size-lt",
+        help="",
+    )
+
     # Authentication options
     auth_group = parser.add_argument_group("Authentication arguments")
 
@@ -487,6 +523,8 @@ async def async_main():
         accept_new=args.accept_new,
         ignore_case=args.ignore_case,
         dry_run=args.dry_run,
+        size_gt=args.size_gt,
+        size_lt=args.size_lt,
     )
 
     try:
